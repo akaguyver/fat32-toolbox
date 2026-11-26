@@ -1,31 +1,37 @@
 # FAT32 Toolbox
 
-An Android-first, no-root storage inspection utility for USB flash drives and SD/microSD cards.
+An Android-first, no-root removable-storage inspection app. No ads, subscriptions, tokens, or root requirement.
 
-## Current status
+## Included in the current build
 
-This repository starts with a buildable Android app scaffold. The first version focuses on safe device discovery and storage inspection. **It does not yet format drives.** Stock Android does not expose a public API for arbitrary USB/SD block-device formatting, and USB host access or the Storage Access Framework alone cannot safely provide that capability. The app will not pretend a format succeeded or offer a destructive button that cannot be implemented reliably.
+- USB peripheral discovery (manufacturer, product, vendor/product IDs, interfaces, mass-storage interface detection).
+- Removable-volume listing from Android's StorageManager.
+- Device-type filter for All, USB, and SD card (classification is best-effort because Android does not consistently expose the physical media type).
+- Capacity and available-space reporting when Android exposes a mounted volume path.
+- Filesystem detection from the Android mount table when readable.
+- Manual volume/folder selection through Android's Storage Access Framework.
+- Desired-format selector for FAT32, exFAT, and NTFS, with compatibility notes.
+- GitHub Actions workflow to build a debug APK.
 
-## Goals
+## Formatting status — not implemented yet
 
-- Work across different USB mass-storage devices and SD/microSD readers, not just one drive.
-- Show connected USB peripherals and let the user select an accessible storage folder through Android's system picker.
-- Display filesystem and capacity details where Android exposes them.
-- Keep all destructive operations opt-in, clearly identify the target, and verify results.
-- No ads, subscriptions, tokens, or root requirement.
-- Build APKs with GitHub Actions.
+The format selector is a preference only. It does not format or erase media. An ordinary unrooted Android app can generally obtain document/file access through the Storage Access Framework, but that is not raw block-device access. Android does not provide a public general-purpose API for third-party apps to format arbitrary USB/SD media.
 
-## Important Android limitation
+A future formatter needs a verified backend and reliable device identity. Shizuku by itself is not a guarantee: the device must expose the correct block device, the required formatter binaries must exist, permissions and SELinux must allow the operation, and the app must prove the target is removable media rather than internal storage. Until those conditions are validated on real devices, formatting stays disabled for safety.
 
-On an unrooted phone, Android's public APIs generally grant file/document access, not raw block-device access. Formatting FAT32 on arbitrary external media therefore needs a separately validated privileged backend or a supported system/vendor formatting interface. Shizuku alone is not a guarantee: availability of `mkfs.fat`, block-device permissions, SELinux policy, and Android version all matter. This project deliberately treats formatting as unsupported until a backend can be tested on real devices without risking internal storage.
+## Detection limitations
+
+- Android may hide mount paths, filesystem type, exact capacity, or partition tables from ordinary apps.
+- A USB card reader and a USB flash drive can look similar to Android; USB-vs-SD classification is best-effort, and a manual picker is provided.
+- Partition-table inspection requires lower-level access not generally available to a normal app.
 
 ## Build
 
-Open this repository in Android Studio, or use the included GitHub Actions workflow to build a debug APK. The workflow uploads the APK as an artifact.
+Open in Android Studio, or run the GitHub Actions workflow (`Actions` → `Android APK` → `Run workflow`). The workflow uploads `app-debug.apk` as an artifact.
 
-## Device testing
+## Test safely
 
-Test with expendable media first. Confirm that Android mounts the device and that the selected folder is on the intended removable volume. Do not use the app for formatting until a verified formatting backend is implemented.
+Connect removable media, tap Refresh devices, and inspect the detected volume. No formatting is performed by this version. Test with expendable media before any future destructive feature.
 
 ## License
 
