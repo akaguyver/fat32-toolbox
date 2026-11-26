@@ -38,7 +38,7 @@ class MainActivity : ComponentActivity() {
     private var volumes by mutableStateOf(listOf<VolumeInfo>())
     private var selectedIndex by mutableIntStateOf(-1)
     private var selectedFolderInfo by mutableStateOf("No folder selected.")
-    private var deviceFilter by mutableStateOf("All")
+    private var deviceFilter by mutableStateOf("USB")
     private var formatChoice by mutableStateOf("FAT32")
     private var formatMenuOpen by mutableStateOf(false)
     private var deviceMenuOpen by mutableStateOf(false)
@@ -59,7 +59,7 @@ class MainActivity : ComponentActivity() {
                         HorizontalDivider()
                         Text("Choose device type", style = MaterialTheme.typography.titleLarge)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            listOf("All", "USB", "SD card").forEach { type ->
+                            listOf("USB").forEach { type ->
                                 FilterChip(selected = deviceFilter == type, onClick = { deviceFilter = type; selectedIndex = -1 }, label = { Text(type) })
                             }
                         }
@@ -131,7 +131,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun refreshVolumes() {
+    private fun refreshVolumes() {\n        android.util.Log.i("FAT32Toolbox", "SD_FUTURE_PROBE: checking Android StorageManager for removable volumes; SD formatting is not enabled.")
         val sm = getSystemService(STORAGE_SERVICE) as StorageManager
         val found = mutableListOf<VolumeInfo>()
         for (v in sm.storageVolumes) {
@@ -145,7 +145,7 @@ class MainActivity : ComponentActivity() {
             val fs = path?.let { detectFilesystem(it) } ?: "Unknown"
             val lower = label.lowercase(Locale.ROOT)
             val category = when {
-                lower.contains("sd") || lower.contains("card") -> "SD card"
+                lower.contains("sd") || lower.contains("card") -> "SD future candidate (not enabled)"
                 lower.contains("usb") || usbHasMassStorage() -> "USB / card reader"
                 else -> "Removable storage"
             }
