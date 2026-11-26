@@ -1,6 +1,6 @@
 # FAT32 Toolbox
 
-An Android-first, no-root removable-storage inspection app. No ads, subscriptions, tokens, or root requirement.
+An Android-first, no-root app that inspects and formats USB drives and SD cards in USB readers. No ads, subscriptions, tokens, or root requirement.
 
 ## Included in the current build
 
@@ -10,14 +10,31 @@ An Android-first, no-root removable-storage inspection app. No ads, subscription
 - Capacity and available-space reporting when Android exposes a mounted volume path.
 - Filesystem detection from the Android mount table when readable.
 - Manual volume/folder selection through Android's Storage Access Framework.
+- FAT32 formatting of USB drives and SD cards in USB readers (see below).
 - Desired-format selector for FAT32, exFAT, and NTFS, with compatibility notes.
-- GitHub Actions workflow to build a debug APK.
 
-## Formatting status — not implemented yet
+## Formatting (FAT32)
 
-The format selector is a preference only. It does not format or erase media. An ordinary unrooted Android app can generally obtain document/file access through the Storage Access Framework, but that is not raw block-device access. Android does not provide a public general-purpose API for third-party apps to format arbitrary USB/SD media.
+The app formats USB flash drives, and SD/microSD cards in a USB card reader, as FAT32, without root.
 
-A future formatter needs a verified backend and reliable device identity. Shizuku by itself is not a guarantee: the device must expose the correct block device, the required formatter binaries must exist, permissions and SELinux must allow the operation, and the app must prove the target is removable media rather than internal storage. Until those conditions are validated on real devices, formatting stays disabled for safety.
+How it works: through Android's USB host API the app claims the drive's mass-storage interface and sends SCSI read/write commands to it directly (using [libaums](https://github.com/magnusja/libaums) for the USB transport). This takes the drive away from Android, which unmounts it. The app then writes:
+
+- an MBR partition table with one FAT32 (LBA, type 0x0C) partition starting at 1 MiB,
+- a FAT32 filesystem following Microsoft's spec: 2 FATs, Microsoft's default cluster sizes, FSInfo, backup boot sector, optional volume label,
+- zeros over the old partition table area and the end of the disk (where a GPT backup lives).
+
+The partition table is written last, and every structure is read back and compared afterwards.
+
+Safety: the formatter only ever reaches devices attached over USB, so it can't touch the phone's internal storage. You must pick the drive, see its size, and type ERASE before anything is written.
+
+Limits:
+
+- FAT32 only. exFAT and NTFS can be selected for information but aren't written yet.
+- Drives from about 33 MB to 2 TiB (the MBR limit). Single files on FAT32 can't exceed 4 GB.
+- A card in the phone's own SD slot isn't reachable this way (that needs root or a system formatter).
+- After formatting, unplug and replug the drive so Android mounts it again.
+
+The formatter is tested on disk images: `gradle :app:testDebugUnitTest`, then `tools/check-fat32-images.sh` checks the images with `fsck.fat` from dosfstools.
 
 ## Detection limitations
 
@@ -27,11 +44,11 @@ A future formatter needs a verified backend and reliable device identity. Shizuk
 
 ## Build
 
-Open in Android Studio, or run the GitHub Actions workflow (`Actions` → `Android APK` → `Run workflow`). The workflow uploads `app-debug.apk` as an artifact.
+Open in Android Studio, or build locally with Gradle 8.9+ and JDK 17: `gradle :app:assembleDebug`.
 
 ## Test safely
 
-Connect removable media, tap Refresh devices, and inspect the detected volume. No formatting is performed by this version. Test with expendable media before any future destructive feature.
+Try formatting on an expendable drive first. Check the size shown in the confirmation dialog matches the drive you mean to erase.
 
 ## License
 

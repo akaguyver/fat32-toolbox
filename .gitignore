@@ -4,4 +4,4 @@
 /.idea
 /build
 /app/build
-.DS_Store
+.DS_Store.kotlin

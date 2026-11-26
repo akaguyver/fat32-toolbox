@@ -1,6 +1,10 @@
 package com.akaguyver.fat32toolbox
 
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbManager
 import android.net.Uri
@@ -10,6 +14,7 @@ import android.os.StatFs
 import android.os.storage.StorageManager
 import android.os.storage.StorageVolume
 import android.util.Log
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -20,7 +25,22 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
+import androidx.lifecycle.lifecycleScope
+import com.akaguyver.fat32toolbox.format.DiskProbe
+import com.akaguyver.fat32toolbox.format.DiskReport
+import com.akaguyver.fat32toolbox.format.Fat32Formatter
+import com.akaguyver.fat32toolbox.format.Fat32Layout
+import com.akaguyver.fat32toolbox.format.FormatException
+import com.akaguyver.fat32toolbox.usb.OpenedUsbDrive
+import com.akaguyver.fat32toolbox.usb.UsbDisk
+import com.akaguyver.fat32toolbox.usb.UsbDrive
+import com.akaguyver.fat32toolbox.usb.UsbDrives
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import me.jahnen.libaums.core.driver.scsi.commands.sense.DataProtect
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -49,6 +69,37 @@ class MainActivity : ComponentActivity() {
     private var deviceMenuOpen by mutableStateOf(false)
     private val diagnosticEvents = mutableListOf<String>()
 
+    // Formatting through the USB host API (raw sector access; works without root).
+    private var usbDrives by mutableStateOf(listOf<UsbDrive>())
+    private var opened by mutableStateOf<OpenedUsbDrive?>(null)
+    private var selectedLun by mutableIntStateOf(-1)
+    private var labelInput by mutableStateOf("USB DRIVE")
+    private var formatStatus by mutableStateOf("")
+    private var busy by mutableStateOf(false)
+    private var formatting by mutableStateOf(false)
+    private var formatProgress by mutableFloatStateOf(0f)
+    private var confirmOpen by mutableStateOf(false)
+    private var confirmText by mutableStateOf("")
+    private var pendingDrive: UsbDrive? = null
+    private var probes by mutableStateOf<Map<Int, Result<DiskReport>>>(emptyMap())
+    private val usbPermissionAction by lazy { "$packageName.USB_PERMISSION" }
+
+    private val usbPermissionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != usbPermissionAction) return
+            val drive = pendingDrive ?: return
+            pendingDrive = null
+            val usbManager = getSystemService(USB_SERVICE) as UsbManager
+            if (usbManager.hasPermission(drive.device)) {
+                logEvent("USB permission granted for ${drive.name}")
+                openDrive(drive)
+            } else {
+                logEvent("USB permission denied for ${drive.name}")
+                formatStatus = "USB permission was denied, so the app can't reach the drive."
+            }
+        }
+    }
+
     private val folderPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
         logEvent("Folder picker result: ${if (uri == null) "cancelled" else "URI granted"}")
         uri?.let { inspectFolder(it) }
@@ -61,6 +112,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         logEvent("App started; Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}); device ${Build.MANUFACTURER} ${Build.MODEL}")
+        ContextCompat.registerReceiver(this, usbPermissionReceiver, IntentFilter(usbPermissionAction), ContextCompat.RECEIVER_NOT_EXPORTED)
         refreshAll()
         setContent {
             MaterialTheme {
@@ -120,8 +172,10 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         Text(formatDescription(formatChoice))
-                        Text("Formatting is not enabled. This selector records your choice only; no disk changes are made. Stock Android does not provide a public API for arbitrary removable-drive formatting.", style = MaterialTheme.typography.bodyMedium)
-                        Text("Diagnostics help determine what Android exposes. They do not prove that raw formatting is safe or permitted.", style = MaterialTheme.typography.bodyMedium)
+                        FormatSection()
+                        HorizontalDivider()
+                        Text("Diagnostics", style = MaterialTheme.typography.titleLarge)
+                        Text("The log records what Android exposed and every step of a format. Review it before sharing: it includes device names.", style = MaterialTheme.typography.bodyMedium)
                         OutlinedButton(onClick = { logPicker.launch("fat32-toolbox-diagnostics.txt") }, modifier = Modifier.fillMaxWidth()) {
                             Text("Export diagnostic log")
                         }
@@ -131,16 +185,184 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onDestroy() {
+        unregisterReceiver(usbPermissionReceiver)
+        // Never cut the connection in the middle of a format; the write would be left half done.
+        if (!formatting) opened?.close()
+        super.onDestroy()
+    }
+
+    @Composable
+    private fun FormatSection() {
+        HorizontalDivider()
+        Text("Format a USB drive", style = MaterialTheme.typography.titleLarge)
+        Text("Works with USB flash drives and SD cards in a USB card reader, through USB OTG. It talks to the drive directly over USB, so it can never touch the phone's internal storage. A card in the phone's own SD slot can't be formatted this way.", style = MaterialTheme.typography.bodyMedium)
+        val o = opened
+        if (o == null) {
+            if (usbDrives.isEmpty()) Text("No USB drive found. Plug one in and tap Refresh devices.")
+            usbDrives.forEach { d ->
+                OutlinedButton(onClick = { connect(d) }, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+                    Text("Check / format ${d.name} (${d.ids})")
+                }
+            }
+            if (usbDrives.isNotEmpty()) Text("Connecting takes the drive away from Android: it disappears from Files until you unplug and replug it. Close any app that is copying to it first.", style = MaterialTheme.typography.bodySmall)
+        } else {
+            Text("Connected: ${o.drive.name} (${o.drive.ids})")
+            if (o.disks.isEmpty()) Text("No media found. For a card reader, check that a card is inserted, then disconnect and connect again.")
+            o.disks.forEachIndexed { i, disk ->
+                val size = diskSize(disk)
+                FilterChip(selected = selectedLun == i, onClick = { selectedLun = i }, enabled = !busy,
+                    label = { Text((if (o.disks.size > 1) "Slot ${disk.lun + 1}: " else "") + size) })
+                Text("Current format: " + describe(probes[i], disk.sectorSize), style = MaterialTheme.typography.bodyMedium)
+            }
+            val disk = o.disks.getOrNull(selectedLun)
+            if (disk != null) {
+                val plan = remember(disk) { planFor(disk) }
+                OutlinedTextField(value = labelInput, onValueChange = { labelInput = it.take(11) }, enabled = !busy,
+                    label = { Text("Volume label (up to 11 characters)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                val labelError = try { Fat32Formatter.normalizeLabel(labelInput); null } catch (e: FormatException) { e.message }
+                labelError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                when {
+                    formatChoice != "FAT32" -> Text("Only FAT32 can be written for now. Choose FAT32 above to format.", color = MaterialTheme.colorScheme.error)
+                    plan.second != null -> Text(plan.second!!, color = MaterialTheme.colorScheme.error)
+                    else -> {
+                        val l = plan.first!!
+                        Text("Will create one MBR partition with FAT32, ${formatBytes(l.clusterBytes.toLong())} clusters, ${formatBytes(l.usableBytes)} usable. Files over 4 GB can't be stored on FAT32.")
+                        Button(onClick = { confirmText = ""; confirmOpen = true }, enabled = !busy && labelError == null,
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error), modifier = Modifier.fillMaxWidth()) {
+                            Text("Erase and format as FAT32")
+                        }
+                    }
+                }
+            }
+            OutlinedButton(onClick = { disconnect("Disconnected. Unplug and replug the drive so Android mounts it again.") }, enabled = !busy) { Text("Disconnect") }
+        }
+        if (formatting) LinearProgressIndicator(progress = { formatProgress }, modifier = Modifier.fillMaxWidth())
+        if (formatStatus.isNotEmpty()) Text(formatStatus)
+
+        val target = opened?.disks?.getOrNull(selectedLun)
+        if (confirmOpen && target != null) {
+            AlertDialog(
+                onDismissRequest = { confirmOpen = false },
+                title = { Text("Erase this drive?") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Everything on ${opened?.drive?.name} (${diskSize(target)}) will be permanently erased and it will be formatted as FAT32.")
+                        Text("Type ERASE to confirm.")
+                        OutlinedTextField(value = confirmText, onValueChange = { confirmText = it }, singleLine = true)
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { confirmOpen = false; startFormat(target) }, enabled = confirmText.trim() == "ERASE") { Text("Erase and format") }
+                },
+                dismissButton = { TextButton(onClick = { confirmOpen = false }) { Text("Cancel") } },
+            )
+        }
+    }
+
+    private fun describe(r: Result<DiskReport>?, sectorSize: Int): String {
+        if (r == null) return "Not read"
+        val report = r.getOrElse { return "Couldn't read the drive (${it.message ?: it.javaClass.simpleName})" }
+        if (report.partitions.isEmpty()) return report.table
+        val parts = report.partitions.joinToString("; ") { p ->
+            val size = formatBytes(p.sectorCount * sectorSize)
+            "${p.filesystem}${p.label?.let { " \"$it\"" } ?: ""}, $size"
+        }
+        return "$parts (partition table: ${report.table})"
+    }
+
+    private fun diskSize(disk: UsbDisk): String = try {
+        "${formatBytes(disk.sectorCount * disk.sectorSize)} (${disk.sectorCount} sectors of ${disk.sectorSize} bytes)"
+    } catch (e: Exception) { e.message ?: "Unknown size" }
+
+    private fun planFor(disk: UsbDisk): Pair<Fat32Layout?, String?> = try {
+        Fat32Formatter.plan(disk.sectorCount, disk.sectorSize) to null
+    } catch (e: Exception) { null to (e.message ?: "Can't format this drive as FAT32") }
+
+    private fun connect(drive: UsbDrive) {
+        val usbManager = getSystemService(USB_SERVICE) as UsbManager
+        if (usbManager.hasPermission(drive.device)) { openDrive(drive); return }
+        pendingDrive = drive
+        formatStatus = "Waiting for USB permission…"
+        logEvent("Requesting USB permission for ${drive.name} (${drive.ids})")
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0)
+        val pi = PendingIntent.getBroadcast(this, 0, Intent(usbPermissionAction).setPackage(packageName), flags)
+        usbManager.requestPermission(drive.device, pi)
+    }
+
+    private fun openDrive(drive: UsbDrive) {
+        busy = true
+        formatStatus = "Connecting to ${drive.name}…"
+        lifecycleScope.launch(Dispatchers.IO) {
+            val result = runCatching { UsbDrives.open(getSystemService(USB_SERVICE) as UsbManager, drive, ::logEvent) }
+            val found = result.getOrNull()?.disks?.mapIndexed { i, disk ->
+                i to runCatching { DiskProbe.probe(disk) }.onFailure { logEvent("Probe of LUN ${disk.lun} failed: ${it.javaClass.simpleName}: ${it.message}") }
+            }?.toMap() ?: emptyMap()
+            result.getOrNull()?.disks?.forEachIndexed { i, disk -> logEvent("Probe LUN ${disk.lun}: ${describe(found[i], disk.sectorSize)}") }
+            withContext(Dispatchers.Main) {
+                busy = false
+                probes = found
+                result.onSuccess { o ->
+                    opened = o
+                    selectedLun = if (o.disks.size == 1) 0 else -1
+                    formatStatus = if (o.disks.size > 1) "Choose the slot to format." else ""
+                    logEvent("Connected to ${drive.name}: ${o.disks.size} disk(s) with media")
+                }.onFailure { e ->
+                    logEvent("Open failed: ${e.javaClass.simpleName}: ${e.message}")
+                    formatStatus = "Couldn't connect: ${e.message ?: e.javaClass.simpleName}. Unplug and replug the drive, then try again."
+                }
+            }
+        }
+    }
+
+    private fun disconnect(message: String) {
+        try { opened?.close() } catch (e: Exception) { logEvent("Close failed: ${e.message}") }
+        opened = null
+        probes = emptyMap()
+        selectedLun = -1
+        formatStatus = message
+        refreshAll()
+    }
+
+    private fun startFormat(disk: UsbDisk) {
+        val label = try { Fat32Formatter.normalizeLabel(labelInput) } catch (e: FormatException) { formatStatus = e.message ?: ""; return }
+        busy = true; formatting = true; formatProgress = 0f
+        formatStatus = "Formatting… don't unplug the drive."
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        logEvent("Format started: LUN ${disk.lun}, ${disk.sectorCount} sectors x ${disk.sectorSize}, label='$label'")
+        lifecycleScope.launch(Dispatchers.IO) {
+            val message = try {
+                val l = Fat32Formatter.format(disk, label, progress = { done, total -> formatProgress = done.toFloat() / total })
+                logEvent("Format finished and verified: partitionStart=${l.partitionStart}, clusters=${l.clusterCount}, clusterBytes=${l.clusterBytes}, fatSectors=${l.fatSectors}")
+                "Done: formatted as FAT32${if (label.isNotEmpty()) " \"$label\"" else ""}, ${formatBytes(l.usableBytes)} usable, and checked by reading it back. Unplug the drive and plug it back in to use it."
+            } catch (e: DataProtect) {
+                logEvent("Format failed: write protected")
+                "The drive is write-protected. If it's an SD card, check the lock switch on its side. Nothing was changed."
+            } catch (e: Exception) {
+                logEvent("Format failed: ${e.javaClass.simpleName}: ${e.message}")
+                "Format failed: ${e.message ?: e.javaClass.simpleName}. The drive may be left unreadable; unplug and replug it, then try again."
+            }
+            withContext(Dispatchers.Main) {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                formatting = false; busy = false
+                disconnect(message)
+            }
+        }
+    }
+
     private fun logEvent(message: String) {
         val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
-        diagnosticEvents.add("$stamp  $message")
-        if (diagnosticEvents.size > 300) diagnosticEvents.removeAt(0)
+        synchronized(diagnosticEvents) {
+            diagnosticEvents.add("$stamp  $message")
+            if (diagnosticEvents.size > 300) diagnosticEvents.removeAt(0)
+        }
         Log.i("FAT32Toolbox", message)
     }
 
     private fun refreshAll() {
         logEvent("Refresh started")
         refreshUsbDevices()
+        if (opened == null) usbDrives = try { UsbDrives.find(getSystemService(USB_SERVICE) as UsbManager) } catch (e: Exception) { emptyList() }
         refreshVolumes()
         logEvent("Refresh finished: ${volumes.size} removable volume(s) listed")
     }
@@ -165,7 +387,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun refreshVolumes() {
-        logEvent("SD_FUTURE_PROBE: checking Android StorageManager removable volumes; SD formatting remains disabled")
+        logEvent("Checking Android StorageManager removable volumes")
         try {
             val sm = getSystemService(STORAGE_SERVICE) as StorageManager
             val found = mutableListOf<VolumeInfo>()
@@ -271,9 +493,8 @@ class MainActivity : ComponentActivity() {
             appendLine(selectedFolderInfo)
             appendLine()
             appendLine("Event log (most recent 300 events):")
-            diagnosticEvents.forEach { appendLine(it) }
+            synchronized(diagnosticEvents) { diagnosticEvents.forEach { appendLine(it) } }
             appendLine()
-            appendLine("Limitations: this report is observational only. It does not establish raw block-device access, exclusive device control, formatter availability, or safe-to-format status.")
             appendLine("Privacy: includes device model, USB identifiers, volume labels and mount paths when Android exposes them. Review before sharing.")
         }
         try {
